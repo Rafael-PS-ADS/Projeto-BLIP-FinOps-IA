@@ -1,0 +1,17 @@
+# Variaveis de ambiente (Seguranca)
+.env
+
+# Ambientes virtuais (Python)
+.venv
+venv
+env
+bin/
+lib/
+include/
+
+# Caches de Python
+__pycache__/
+*.py[cod]
+
+# Arquivos temporarios do Streamlit
+.streamlit/
