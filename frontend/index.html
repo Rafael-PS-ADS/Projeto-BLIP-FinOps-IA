@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Active FinOps Copilot – Azure</title>
+    <!-- Modern Typography -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Hero Header -->
+        <header class="hero-section">
+            <div class="hero-badge">⚡ AI-Powered · Azure FinOps</div>
+            <h1 class="hero-title">Copilot CLI – Active FinOps</h1>
+            <p class="hero-subtitle">Identificação e Remediação Automática de Desperdícios no Azure &nbsp;·&nbsp; Powered by Gemini</p>
+        </header>
+
+        <!-- Metrics Grid -->
+        <section class="metric-grid">
+            <div class="metric-card">
+                <div class="metric-label">💸 Desperdício Total Identificado</div>
+                <div class="metric-value danger" id="metric-total">R$ 0</div>
+                <div class="metric-delta">/ mês · <span id="metric-count">0</span> recursos analisados</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">🎯 Economia Potencial Estimada</div>
+                <div class="metric-value warning" id="metric-savings">R$ 0</div>
+                <div class="metric-delta">após remediações sugeridas</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">🖥️ VMs com Baixo Consumo</div>
+                <div class="metric-value info" id="metric-vms">0</div>
+                <div class="metric-delta">candidatas a resize ou desligamento</div>
+            </div>
+        </section>
+
+        <!-- Action Table -->
+        <section class="action-section">
+            <div class="section-header">
+                <h2 class="section-title">🔍 Recursos com Desperdício Detectado</h2>
+                <div class="section-divider"></div>
+            </div>
+            
+            <div id="resources-container" class="resources-list">
+                <!-- Injetado via JS -->
+                <div class="loading">Carregando recursos...</div>
+            </div>
+        </section>
+
+        <!-- Footer -->
+        <footer class="footer">
+            Active FinOps Copilot – Azure &nbsp;·&nbsp; Enterprise Architecture (FastAPI + Vanilla JS) · 2025
+        </footer>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="/js/app.js"></script>
+</body>
+</html>

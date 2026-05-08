@@ -1,0 +1,947 @@
+=== app.py ===
+import streamlit as st
+from dotenv import load_dotenv
+
+# Carrega a variável de ambiente (GEMINI_API_KEY) do arquivo .env
+load_dotenv()
+
+from data.mocks import get_mock_dataframe
+from core.ai_engine import gerar_script_remediacao
+from ui.styles import apply_custom_css
+from ui.components import render_hero, render_metrics, render_ai_response, render_footer
+
+# ─────────────────────────────────────────────
+#  PAGE CONFIG & SETUP
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="Active FinOps Copilot – Azure",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+apply_custom_css()
+
+# ─────────────────────────────────────────────
+#  RENDERIZAÇÃO PRINCIPAL
+# ─────────────────────────────────────────────
+render_hero()
+
+df = get_mock_dataframe()
+total_desperdicio = df["Custo Mensal (R$)"].sum()
+n_recursos = len(df)
+n_vms = len(df[df["Tipo"] == "VM"])
+
+render_metrics(total_desperdicio, n_recursos, n_vms)
+
+# ─────────────────────────────────────────────
+#  TABELA DE AÇÃO
+# ─────────────────────────────────────────────
+st.markdown(
+    '<div class="section-title">🔍 Recursos com Desperdício Detectado</div><div class="section-divider"></div>',
+    unsafe_allow_html=True,
+)
+
+BADGE_MAP = {"VM": "badge-vm", "Managed Disk": "badge-disk", "Snapshot": "badge-snapshot"}
+
+if "scripts" not in st.session_state:
+    st.session_state.scripts = {}
+
+for idx, row in df.iterrows():
+    tipo = row["Tipo"]
+    badge_class = BADGE_MAP.get(tipo, "badge-vm")
+
+    col_info, col_cpu, col_cost, col_btn = st.columns([3.5, 1.2, 1.5, 2])
+
+    with col_info:
+        st.markdown(
+            f"""
+            <div style="padding: 0.5rem 0;">
+                <span class="resource-name">{row['Recurso']}</span>
+                <span class="resource-type-badge {badge_class}">{tipo}</span>
+                <br/>
+                <span class="problem-tag">⚠ {row['Problema']}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col_cpu:
+        st.markdown(
+            f"""
+            <div style="padding:0.5rem 0; font-size:0.82rem; color:#64748b; font-weight:500;">
+                <span style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.08em;">CPU Média</span><br/>
+                <span style="font-size:1.1rem; color:#94a3b8; font-weight:700;">{row['CPU Média (%)']}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col_cost:
+        st.markdown(
+            f"""
+            <div style="padding:0.5rem 0;">
+                <span style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.08em;color:#64748b;">Custo/mês</span><br/>
+                <span class="resource-cost">R$ {row['Custo Mensal (R$)']:,}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col_btn:
+        st.write("")  # alinhamento vertical
+        if st.button(f"⚙️ Gerar Script (Copilot)", key=f"btn_{idx}"):
+            with st.spinner(f"🤖 Analisando `{row['Recurso']}`..."):
+                script = gerar_script_remediacao(row)
+                st.session_state.scripts[idx] = script
+
+    if idx in st.session_state.scripts:
+        render_ai_response(st.session_state.scripts[idx])
+
+    st.markdown('<hr style="border:none;border-top:1px solid rgba(56,189,248,0.07);margin:0.3rem 0 0.8rem 0;">', unsafe_allow_html=True)
+
+render_footer()
+
+=== backend/main.py ===
+import os
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# Carrega variáveis de ambiente
+load_dotenv()
+
+print(f"DEBUG: API KEY carregada: {os.getenv('GEMINI_API_KEY')[:10]}...")
+
+from core.ai_engine import gerar_script_remediacao
+from data.mocks import get_mock_resources
+
+app = FastAPI(title="Active FinOps API")
+
+class RemediateRequest(BaseModel):
+    id: str
+
+@app.get("/api/resources")
+def get_resources():
+    resources = get_mock_resources()
+    total_desperdicio = sum(r["custo_mensal"] for r in resources)
+    n_vms = sum(1 for r in resources if r["tipo"] == "VM")
+    economia_potencial = int(total_desperdicio * 0.65)
+    
+    return {
+        "resources": resources,
+        "metrics": {
+            "total_desperdicio": total_desperdicio,
+            "economia_potencial": economia_potencial,
+            "n_vms": n_vms,
+            "n_recursos": len(resources)
+        }
+    }
+
+@app.post("/api/remediate")
+def remediate_resource(req: RemediateRequest):
+    resources = get_mock_resources()
+    # Busca o recurso pelo ID
+    recurso = next((r for r in resources if r["id"] == req.id), None)
+    if not recurso:
+        raise HTTPException(status_code=404, detail="Recurso não encontrado")
+    
+    # Gera script via Gemini
+    script = gerar_script_remediacao(recurso)
+    return {"script": script}
+
+# Serve o frontend de forma estática
+app.mount("/css", StaticFiles(directory="frontend/css"), name="css")
+app.mount("/js", StaticFiles(directory="frontend/js"), name="js")
+
+@app.get("/")
+def read_index():
+    return FileResponse("frontend/index.html")
+
+=== backend/core/ai_engine.py ===
+import os
+from google import genai
+from pydantic import BaseModel
+
+SYSTEM_PROMPT = """Você é um engenheiro de Cloud FinOps especialista em Azure.
+O recurso Azure abaixo está gerando desperdício.
+Baseado no problema descrito, escreva APENAS o comando de terminal do Azure CLI (az cli) necessário para consertar isso (ex: az vm resize, az disk delete, az resource tag).
+Adicione uma breve explicação técnica de 1 linha embaixo do código.
+Responda em português (pt-BR).
+Dados do recurso:
+{dados}"""
+
+def get_gemini_client():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY não configurada no ambiente (.env).")
+    return genai.Client(api_key=api_key)
+
+def gerar_script_remediacao(recurso_data: dict) -> str:
+    """Aciona a API do Gemini para gerar o script az cli."""
+    dados_formatados = (
+        f"Recurso: {recurso_data.get('recurso')}\n"
+        f"Tipo: {recurso_data.get('tipo')}\n"
+        f"CPU Média: {recurso_data.get('cpu_media')}\n"
+        f"Custo Mensal: R$ {recurso_data.get('custo_mensal')}\n"
+        f"Problema: {recurso_data.get('problema')}"
+    )
+    prompt = SYSTEM_PROMPT.format(dados=dados_formatados)
+    
+    try:
+        client = get_gemini_client()
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        error_msg = str(e)
+        print(f"ERROR GEMINI: {error_msg}")  # Log para debug no servidor
+        
+        if "429" in error_msg or "quota" in error_msg.lower() or "RESOURCE_EXHAUSTED" in error_msg:
+            fallback = f"# ⚠️ Limite de cota da API atingido (Fallback Ativado)\n"
+            tipo = recurso_data.get("tipo", "")
+            recurso = recurso_data.get("recurso", "recurso-desconhecido")
+            
+            if "VM" in tipo:
+                fallback += f"az vm resize --resource-group rg-finops --name {recurso} --size Standard_B2s\n"
+                fallback += f"# Sugestão: Reduzir o tamanho da VM para adequar ao baixo uso (CPU: {recurso_data.get('cpu_media')})."
+            elif "Disk" in tipo:
+                fallback += f"az disk delete --resource-group rg-finops --name {recurso} --yes\n"
+                fallback += f"# Sugestão: Deletar disco órfão para evitar cobranças inativas."
+            elif "SQL" in tipo or "Database" in tipo:
+                fallback += f"az sql db update --resource-group rg-finops --server server-name --name {recurso} --tier GeneralPurpose --family Gen5 --capacity 2\n"
+                fallback += f"# Sugestão: Escalonar o banco de dados para um tier menor de acordo com o consumo."
+            else:
+                fallback += f"az resource tag --tags RevisaoFinOps=Pendente --name {recurso}\n"
+                fallback += f"# Sugestão: Recurso marcado para revisão manual pela equipe."
+            
+            return fallback
+
+        # Limitar o tamanho da string de erro para não quebrar a UI
+        return f"# ⚠️ Erro ao contatar a API Gemini\n# Detalhe técnico: {error_msg[:150]}..."
+
+=== backend/data/mocks.py ===
+mock_data = [
+    {
+        "id": "1",
+        "recurso": "vm-blip-prd-01",
+        "tipo": "VM",
+        "cpu_media": "8%",
+        "custo_mensal": 1200,
+        "economia": 800,
+        "problema": "Oversized (Muito grande para o uso)"
+    },
+    {
+        "id": "2",
+        "recurso": "disk-orphan-bkp",
+        "tipo": "Managed Disk",
+        "cpu_media": "N/A",
+        "custo_mensal": 350,
+        "economia": 350,
+        "problema": "Unattached (Disco solto cobrando)"
+    },
+    {
+        "id": "3",
+        "recurso": "vm-teste-dev-04",
+        "tipo": "VM",
+        "cpu_media": "2%",
+        "custo_mensal": 400,
+        "economia": 400,
+        "problema": "Missing Tags (Sem tag de centro de custo)"
+    },
+    {
+        "id": "4",
+        "recurso": "vm-data-worker",
+        "tipo": "VM",
+        "cpu_media": "15%",
+        "custo_mensal": 800,
+        "economia": 500,
+        "problema": "Oversized"
+    },
+    {
+        "id": "5",
+        "recurso": "snap-old-2025",
+        "tipo": "Snapshot",
+        "cpu_media": "N/A",
+        "custo_mensal": 150,
+        "economia": 150,
+        "problema": "Obsoleto (> 90 dias)"
+    }
+]
+
+def get_mock_resources():
+    return mock_data
+
+=== core/ai_engine.py ===
+import os
+import pandas as pd
+from google import genai
+
+SYSTEM_PROMPT = """Você é um engenheiro de Cloud FinOps especialista em Azure.
+O recurso Azure abaixo está gerando desperdício.
+Baseado no problema descrito, escreva APENAS o comando de terminal do Azure CLI (az cli) necessário para consertar isso (ex: az vm resize, az disk delete, az resource tag).
+Adicione uma breve explicação técnica de 1 linha embaixo do código.
+Responda em português (pt-BR).
+Dados do recurso:
+{dados}"""
+
+def get_gemini_client():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY não configurada no ambiente (.env).")
+    return genai.Client(api_key=api_key)
+
+def gerar_script_remediacao(row: pd.Series) -> str:
+    """Aciona a API do Gemini para gerar o script az cli."""
+    dados_formatados = (
+        f"Recurso: {row['Recurso']}\n"
+        f"Tipo: {row['Tipo']}\n"
+        f"CPU Média: {row['CPU Média (%)']}\n"
+        f"Custo Mensal: R$ {row['Custo Mensal (R$)']}\n"
+        f"Problema: {row['Problema']}"
+    )
+    prompt = SYSTEM_PROMPT.format(dados=dados_formatados)
+    
+    try:
+        client = get_gemini_client()
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        return f"# ⚠️ Erro ao contatar a API Gemini\n# {str(e)}"
+
+=== data/mocks.py ===
+import pandas as pd
+
+mock_data = {
+    "Recurso": [
+        "vm-blip-prd-01",
+        "disk-orphan-bkp",
+        "vm-teste-dev-04",
+        "vm-data-worker",
+        "snap-old-2025",
+    ],
+    "Tipo": ["VM", "Managed Disk", "VM", "VM", "Snapshot"],
+    "CPU Média (%)": ["8%", "N/A", "2%", "15%", "N/A"],
+    "Custo Mensal (R$)": [1200, 350, 400, 800, 150],
+    "Problema": [
+        "Oversized (Muito grande para o uso)",
+        "Unattached (Disco solto cobrando)",
+        "Missing Tags (Sem tag de centro de custo)",
+        "Oversized",
+        "Obsoleto (> 90 dias)",
+    ],
+}
+
+def get_mock_dataframe() -> pd.DataFrame:
+    """Retorna o DataFrame de dados mockados simulando recursos do Azure."""
+    return pd.DataFrame(mock_data)
+
+def get_mock_resources() -> list:
+    """Retorna uma lista de dicionários para consumo via API FastAPI."""
+    return [
+        {
+            "id": f"res-{i}",
+            "recurso": mock_data["Recurso"][i],
+            "tipo": mock_data["Tipo"][i],
+            "cpu_media": mock_data["CPU Média (%)"][i],
+            "custo_mensal": mock_data["Custo Mensal (R$)"][i],
+            "problema": mock_data["Problema"][i],
+            # Chaves extras para o motor de IA que espera o formato original do DataFrame
+            "Recurso": mock_data["Recurso"][i],
+            "Tipo": mock_data["Tipo"][i],
+            "CPU Média (%)": mock_data["CPU Média (%)"][i],
+            "Custo Mensal (R$)": mock_data["Custo Mensal (R$)"][i],
+            "Problema": mock_data["Problema"][i]
+        }
+        for i in range(len(mock_data["Recurso"]))
+    ]
+
+=== frontend/index.html ===
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Active FinOps Copilot – Azure</title>
+    <!-- Modern Typography -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Hero Header -->
+        <header class="hero-section">
+            <div class="hero-badge">⚡ AI-Powered · Azure FinOps</div>
+            <h1 class="hero-title">Copilot CLI – Active FinOps</h1>
+            <p class="hero-subtitle">Identificação e Remediação Automática de Desperdícios no Azure &nbsp;·&nbsp; Powered by Gemini</p>
+        </header>
+
+        <!-- Metrics Grid -->
+        <section class="metric-grid">
+            <div class="metric-card">
+                <div class="metric-label">💸 Desperdício Total Identificado</div>
+                <div class="metric-value danger" id="metric-total">R$ 0</div>
+                <div class="metric-delta">/ mês · <span id="metric-count">0</span> recursos analisados</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">🎯 Economia Potencial Estimada</div>
+                <div class="metric-value warning" id="metric-savings">R$ 0</div>
+                <div class="metric-delta">após remediações sugeridas</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">🖥️ VMs com Baixo Consumo</div>
+                <div class="metric-value info" id="metric-vms">0</div>
+                <div class="metric-delta">candidatas a resize ou desligamento</div>
+            </div>
+        </section>
+
+        <!-- Action Table -->
+        <section class="action-section">
+            <div class="section-header">
+                <h2 class="section-title">🔍 Recursos com Desperdício Detectado</h2>
+                <div class="section-divider"></div>
+            </div>
+            
+            <div id="resources-container" class="resources-list">
+                <!-- Injetado via JS -->
+                <div class="loading">Carregando recursos...</div>
+            </div>
+        </section>
+
+        <!-- Footer -->
+        <footer class="footer">
+            Active FinOps Copilot – Azure &nbsp;·&nbsp; Enterprise Architecture (FastAPI + Vanilla JS) · 2025
+        </footer>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="/js/app.js"></script>
+</body>
+</html>
+
+=== frontend/css/style.css ===
+/* ── Reset Global & Variáveis ── */
+:root {
+    --bg-primary: #0a0e1a;
+    --bg-secondary: #0d1b2e;
+    --card-bg: rgba(15, 27, 58, 0.7);
+    --card-border: rgba(56, 189, 248, 0.15);
+    --text-primary: #f8fafc;
+    --text-secondary: #94a3b8;
+    --accent-blue: #38bdf8;
+    --accent-purple: #818cf8;
+    --danger: #f87171;
+    --warning: #fb923c;
+    --success: #34d399;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Inter', sans-serif;
+    background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+    color: var(--text-primary);
+    min-height: 100vh;
+    line-height: 1.5;
+}
+
+.app-container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2rem;
+}
+
+/* ── Hero Section (Glassmorphism) ── */
+.hero-section {
+    background: linear-gradient(135deg, rgba(30, 58, 95, 0.4) 0%, rgba(15, 39, 68, 0.6) 100%);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--card-border);
+    border-radius: 20px;
+    padding: 3rem;
+    margin-bottom: 2.5rem;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05);
+}
+
+.hero-section::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    right: -10%;
+    width: 400px;
+    height: 400px;
+    background: radial-gradient(circle, rgba(56, 189, 248, 0.1) 0%, transparent 60%);
+    pointer-events: none;
+}
+
+.hero-badge {
+    display: inline-block;
+    background: rgba(56, 189, 248, 0.1);
+    border: 1px solid rgba(56, 189, 248, 0.3);
+    color: var(--accent-blue);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 0.4rem 1rem;
+    border-radius: 50px;
+    margin-bottom: 1.2rem;
+}
+
+.hero-title {
+    font-size: 3rem;
+    font-weight: 800;
+    background: linear-gradient(90deg, #ffffff 0%, var(--accent-blue) 50%, var(--accent-purple) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+    margin-bottom: 0.5rem;
+    letter-spacing: -0.02em;
+}
+
+.hero-subtitle {
+    font-size: 1.1rem;
+    color: var(--text-secondary);
+}
+
+/* ── Metrics Grid ── */
+.metric-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1.5rem;
+    margin-bottom: 3rem;
+}
+
+.metric-card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 16px;
+    padding: 1.8rem;
+    backdrop-filter: blur(10px);
+    transition: transform 0.3s ease, box-shadow 0.3s ease, border-color 0.3s ease;
+}
+
+.metric-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 15px 35px rgba(0,0,0,0.3);
+    border-color: rgba(56, 189, 248, 0.4);
+}
+
+.metric-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-secondary);
+    font-weight: 600;
+    margin-bottom: 0.8rem;
+}
+
+.metric-value {
+    font-size: 2.2rem;
+    font-weight: 800;
+    line-height: 1;
+}
+.metric-value.danger { color: var(--danger); }
+.metric-value.warning { color: var(--warning); }
+.metric-value.info { color: var(--accent-blue); }
+
+.metric-delta {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    margin-top: 0.5rem;
+}
+
+/* ── Action Section ── */
+.section-header { margin-bottom: 1.5rem; }
+.section-title { font-size: 1.25rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 0.5rem; }
+.section-divider { height: 1px; background: linear-gradient(90deg, rgba(56,189,248,0.3) 0%, transparent 100%); margin-top: 0.8rem; }
+
+.resource-card {
+    background: rgba(10, 18, 40, 0.6);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    transition: background 0.2s;
+}
+
+.resource-card:hover {
+    background: rgba(15, 27, 58, 0.8);
+    border-color: rgba(56, 189, 248, 0.2);
+}
+
+.res-info { flex: 2; min-width: 250px; }
+.res-name { font-size: 1.1rem; font-weight: 700; font-family: 'Courier New', Courier, monospace; color: #fff; }
+.res-badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 6px; font-size: 0.7rem; font-weight: 600; margin-left: 0.5rem; vertical-align: middle; }
+.badge-VM { background: rgba(129,140,248,0.15); color: var(--accent-purple); border: 1px solid rgba(129,140,248,0.3); }
+.badge-Managed { background: rgba(251,146,60,0.15); color: var(--warning); border: 1px solid rgba(251,146,60,0.3); }
+.badge-Snapshot { background: rgba(52,211,153,0.15); color: var(--success); border: 1px solid rgba(52,211,153,0.3); }
+
+.problem-tag { display: inline-flex; align-items: center; background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.2); color: var(--danger); border-radius: 6px; padding: 0.25rem 0.6rem; font-size: 0.75rem; font-weight: 500; margin-top: 0.6rem; }
+
+.res-stat { flex: 1; min-width: 100px; }
+.stat-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-secondary); margin-bottom: 0.2rem; }
+.stat-val { font-size: 1.1rem; font-weight: 700; color: #cbd5e1; }
+.stat-cost { font-size: 1.3rem; font-weight: 800; color: var(--danger); }
+
+.res-action { flex: 1; min-width: 150px; text-align: right; }
+.btn-remediate {
+    background: linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-family: inherit;
+    font-weight: 600;
+    font-size: 0.85rem;
+    padding: 0.6rem 1.2rem;
+    cursor: pointer;
+    box-shadow: 0 4px 15px rgba(14,165,233,0.2);
+    transition: all 0.2s ease;
+    width: 100%;
+}
+.btn-remediate:hover { opacity: 0.9; transform: translateY(-2px); box-shadow: 0 6px 20px rgba(14,165,233,0.4); }
+.btn-remediate:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+/* ── AI Response Box ── */
+.ai-response {
+    flex-basis: 100%;
+    margin-top: 1rem;
+    background: rgba(14, 165, 233, 0.05);
+    border-left: 3px solid var(--accent-blue);
+    border-radius: 0 8px 8px 0;
+    padding: 1.2rem;
+    display: none;
+    animation: fadeIn 0.4s ease forwards;
+}
+
+@keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
+
+.ai-header { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent-blue); font-weight: 700; margin-bottom: 0.8rem; }
+.ai-code-wrapper { position: relative; }
+.ai-code { background: #0f172a; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 1rem; font-family: monospace; font-size: 0.85rem; color: #38bdf8; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+.ai-explanation { font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.8rem; font-style: italic; }
+
+/* Loader */
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: #fff; animation: spin 1s ease-in-out infinite; margin-right: 8px; vertical-align: middle; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.footer { text-align: center; color: var(--text-secondary); font-size: 0.8rem; margin-top: 4rem; padding-top: 2rem; border-top: 1px solid rgba(255,255,255,0.05); }
+
+=== frontend/js/app.js ===
+document.addEventListener('DOMContentLoaded', () => {
+    loadResources();
+});
+
+async function loadResources() {
+    try {
+        const response = await fetch('/api/resources');
+        const data = await response.json();
+        
+        updateMetrics(data.metrics);
+        renderResources(data.resources);
+    } catch (error) {
+        console.error('Erro ao carregar dados:', error);
+        document.getElementById('resources-container').innerHTML = '<p class="problem-tag">Erro ao carregar recursos do backend.</p>';
+    }
+}
+
+function updateMetrics(metrics) {
+    document.getElementById('metric-total').innerText = `R$ ${metrics.total_desperdicio.toLocaleString('pt-BR')}`;
+    document.getElementById('metric-savings').innerText = `R$ ${metrics.economia_potencial.toLocaleString('pt-BR')}`;
+    document.getElementById('metric-vms').innerText = metrics.n_vms;
+    document.getElementById('metric-count').innerText = metrics.n_recursos;
+}
+
+function renderResources(resources) {
+    const container = document.getElementById('resources-container');
+    container.innerHTML = '';
+
+    resources.forEach(res => {
+        const badgeClass = res.tipo.includes('Disk') ? 'badge-Managed' : (res.tipo === 'Snapshot' ? 'badge-Snapshot' : 'badge-VM');
+        
+        const card = document.createElement('div');
+        card.className = 'resource-card';
+        card.innerHTML = `
+            <div class="res-info">
+                <span class="res-name">${res.recurso}</span>
+                <span class="res-badge ${badgeClass}">${res.tipo}</span>
+                <br/>
+                <span class="problem-tag">⚠ ${res.problema}</span>
+            </div>
+            <div class="res-stat">
+                <div class="stat-label">CPU Média</div>
+                <div class="stat-val">${res.cpu_media}</div>
+            </div>
+            <div class="res-stat">
+                <div class="stat-label">Custo/Mês</div>
+                <div class="stat-cost">R$ ${res.custo_mensal.toLocaleString('pt-BR')}</div>
+            </div>
+            <div class="res-action">
+                <button class="btn-remediate" onclick="remediate('${res.id}', this)">⚙️ Gerar Script</button>
+            </div>
+            <div class="ai-response" id="ai-res-${res.id}"></div>
+        `;
+        container.appendChild(card);
+    });
+}
+
+async function remediate(id, btnElement) {
+    const originalText = btnElement.innerHTML;
+    btnElement.innerHTML = '<span class="spinner"></span> Analisando...';
+    btnElement.disabled = true;
+
+    const aiContainer = document.getElementById(`ai-res-${id}`);
+    
+    try {
+        const response = await fetch('/api/remediate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: id })
+        });
+        
+        const data = await response.json();
+        
+        // Parse da resposta do Gemini
+        let code = data.script;
+        let explanation = "";
+        
+        const codeMatch = data.script.match(/```(?:bash|azurecli|shell|cli|az)?\s*([\s\S]*?)```/);
+        if (codeMatch) {
+            code = codeMatch[1].trim();
+            explanation = data.script.replace(/```[\s\S]*?```/g, '').trim();
+        }
+
+        aiContainer.innerHTML = `
+            <div class="ai-header">🤖 Script Gerado pelo Copilot (Gemini)</div>
+            <div class="ai-code-wrapper">
+                <div class="ai-code">${code.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
+            </div>
+            ${explanation ? `<div class="ai-explanation">💡 ${explanation}</div>` : ''}
+        `;
+        aiContainer.style.display = 'block';
+
+    } catch (error) {
+        console.error('Erro na remediação:', error);
+        aiContainer.innerHTML = `<span class="problem-tag">Erro ao gerar script com a IA.</span>`;
+        aiContainer.style.display = 'block';
+    } finally {
+        btnElement.innerHTML = '✅ Script Gerado';
+        // Não reabilito o botão para evitar re-geração desnecessária
+    }
+}
+
+=== ui/components.py ===
+import streamlit as st
+import re
+
+def render_hero():
+    st.markdown(
+        """
+        <div class="hero-section">
+            <div class="hero-badge">⚡ AI-Powered · Azure FinOps</div>
+            <div class="hero-title">Copilot CLI – Active FinOps</div>
+            <p class="hero-subtitle">
+                Identificação e Remediação Automática de Desperdícios no Azure
+                &nbsp;·&nbsp; Powered by Gemini 1.5 Flash
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def render_metrics(total_desperdicio: float, n_recursos: int, n_vms: int):
+    economia_potencial = int(total_desperdicio * 0.65)
+    st.markdown(
+        f"""
+        <div class="metric-grid">
+            <div class="metric-card">
+                <div class="metric-label">💸 Desperdício Total Identificado</div>
+                <div class="metric-value danger">R$ {total_desperdicio:,.0f}</div>
+                <div class="metric-delta">/ mês · {n_recursos} recursos analisados</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">🎯 Economia Potencial Estimada</div>
+                <div class="metric-value warning">R$ {economia_potencial:,.0f}</div>
+                <div class="metric-delta">após remediações sugeridas</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">🖥️ VMs com Baixo Consumo</div>
+                <div class="metric-value info">{n_vms}</div>
+                <div class="metric-delta">candidatas a resize ou desligamento</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def render_ai_response(script_text: str):
+    """Extrai o bloco de código markdown e exibe lindamente."""
+    code_match = re.search(r"```(?:bash|azurecli|shell|cli|az)?\s*([\s\S]*?)```", script_text)
+    
+    if code_match:
+        code_part = code_match.group(1).strip()
+        explanation = re.sub(r"```(?:bash|azurecli|shell|cli|az)?[\s\S]*?```", "", script_text).strip()
+    else:
+        lines = script_text.strip().split("\n")
+        code_lines = []
+        exp_lines = []
+        in_code = True
+        for line in lines:
+            if in_code and (line.startswith("az ") or line.startswith("#") or line.strip() == ""):
+                code_lines.append(line)
+            else:
+                in_code = False
+                exp_lines.append(line)
+        code_part = "\n".join(code_lines).strip()
+        explanation = "\n".join(exp_lines).strip()
+
+    with st.container():
+        st.markdown(
+            """
+            <div style="background:rgba(14,165,233,0.06); border-left:3px solid #0ea5e9;
+                 border-radius:0 12px 12px 0; padding:1.2rem 1.5rem; margin: 0.5rem 0 1.5rem 0;">
+                <div style="font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;
+                     color:#38bdf8;font-weight:700;margin-bottom:0.8rem;">
+                    🤖 Script Gerado pelo Copilot (Gemini 1.5 Flash)
+                </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if code_part:
+            st.code(code_part, language="bash")
+        if explanation:
+            st.markdown(
+                f"""<p style="font-size:0.85rem;color:#94a3b8;margin-top:0.6rem;margin-bottom:0;">
+                    💡 <em>{explanation}</em></p>""",
+                unsafe_allow_html=True,
+            )
+        elif not code_part:
+            st.code(script_text, language="bash")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+def render_footer():
+    st.markdown(
+        """
+        <div class="footer">
+            Active FinOps Copilot – Azure &nbsp;·&nbsp; Powered by Google Gemini 1.5 Flash &nbsp;·&nbsp;
+            Arquitetura Modular Refatorada · 2025
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+=== ui/styles.py ===
+import streamlit as st
+
+def apply_custom_css():
+    st.markdown(
+        """
+        <style>
+        /* ── Importar fonte ── */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+        /* ── Reset global ── */
+        html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+        /* ── Background principal ── */
+        .stApp { background: linear-gradient(135deg, #0a0e1a 0%, #0d1b2e 50%, #0a0f1e 100%); color: #e2e8f0; }
+
+        /* ── Header hero ── */
+        .hero-section {
+            background: linear-gradient(135deg, #1e3a5f 0%, #0f2744 40%, #1a1f3a 100%);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            border-radius: 20px;
+            padding: 2.5rem 3rem;
+            margin-bottom: 2rem;
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 0 60px rgba(56, 189, 248, 0.08), 0 20px 60px rgba(0,0,0,0.4);
+        }
+        .hero-badge {
+            display: inline-block;
+            background: rgba(56, 189, 248, 0.15);
+            border: 1px solid rgba(56, 189, 248, 0.4);
+            color: #38bdf8;
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            padding: 0.3rem 0.9rem;
+            border-radius: 50px;
+            margin-bottom: 1rem;
+        }
+        .hero-title {
+            font-size: 2.6rem;
+            font-weight: 800;
+            background: linear-gradient(90deg, #ffffff 0%, #38bdf8 60%, #818cf8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin: 0.2rem 0 0.6rem 0;
+            line-height: 1.15;
+        }
+        .hero-subtitle { font-size: 1rem; color: #94a3b8; margin: 0; }
+
+        /* ── Metric cards ── */
+        .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.2rem; margin-bottom: 2.2rem; }
+        .metric-card {
+            background: linear-gradient(145deg, rgba(30,58,95,0.6) 0%, rgba(15,39,68,0.8) 100%);
+            border: 1px solid rgba(56,189,248,0.18);
+            border-radius: 16px;
+            padding: 1.6rem 1.8rem;
+            backdrop-filter: blur(10px);
+            transition: transform 0.25s ease;
+        }
+        .metric-card:hover { transform: translateY(-3px); box-shadow: 0 12px 40px rgba(56,189,248,0.12); }
+        .metric-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: #64748b; font-weight: 600; margin-bottom: 0.5rem; }
+        .metric-value { font-size: 2rem; font-weight: 800; color: #f8fafc; line-height: 1; }
+        .metric-value.danger { color: #f87171; }
+        .metric-value.warning { color: #fb923c; }
+        .metric-value.info { color: #38bdf8; }
+        .metric-delta { font-size: 0.8rem; color: #94a3b8; margin-top: 0.4rem; }
+
+        /* ── Resources ── */
+        .section-title { font-size: 1.15rem; font-weight: 700; color: #e2e8f0; margin: 2rem 0 1rem 0; }
+        .section-divider { height: 1px; background: linear-gradient(90deg, rgba(56,189,248,0.3) 0%, transparent 80%); margin-bottom: 1.5rem; }
+        
+        .resource-name { font-size: 1.05rem; font-weight: 700; color: #e2e8f0; font-family: 'Courier New', monospace; }
+        .resource-type-badge { display: inline-block; padding: 0.2rem 0.65rem; border-radius: 6px; font-size: 0.72rem; font-weight: 600; margin-left: 0.5rem; }
+        .badge-vm { background: rgba(129,140,248,0.18); color: #818cf8; border: 1px solid rgba(129,140,248,0.3); }
+        .badge-disk { background: rgba(251,146,60,0.15); color: #fb923c; border: 1px solid rgba(251,146,60,0.3); }
+        .badge-snapshot { background: rgba(52,211,153,0.15); color: #34d399; border: 1px solid rgba(52,211,153,0.3); }
+        
+        .problem-tag { display: inline-block; background: rgba(248,113,113,0.12); border: 1px solid rgba(248,113,113,0.28); color: #fca5a5; border-radius: 8px; padding: 0.2rem 0.7rem; font-size: 0.78rem; font-weight: 500; margin-top: 0.4rem; }
+        .resource-cost { font-size: 1.4rem; font-weight: 800; color: #f87171; }
+
+        /* ── Botões e Code ── */
+        .stButton > button {
+            background: linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%) !important; color: white !important; border: none !important;
+            border-radius: 10px !important; font-weight: 600 !important; font-size: 0.85rem !important; padding: 0.55rem 1.2rem !important;
+            width: 100% !important;
+        }
+        .stButton > button:hover { opacity: 0.88 !important; transform: translateY(-1px) !important; }
+        .stCode { border-radius: 12px !important; border: 1px solid rgba(56,189,248,0.2) !important; }
+        
+        .footer { text-align: center; color: #334155; font-size: 0.78rem; margin-top: 3rem; padding: 1.5rem 0; border-top: 1px solid rgba(56,189,248,0.08); }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
