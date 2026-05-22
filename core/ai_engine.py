@@ -11,9 +11,25 @@ Dados do recurso:
 {dados}"""
 
 def get_gemini_client():
+    # First try environment variable
     api_key = os.getenv("GEMINI_API_KEY")
+
+    # If not found, try Streamlit secrets (used by Streamlit Community Cloud)
     if not api_key:
-        raise ValueError("GEMINI_API_KEY não configurada no ambiente (.env).")
+        try:
+            import streamlit as _st
+
+            api_key = _st.secrets.get("GEMINI_API_KEY") if hasattr(_st, "secrets") else None
+        except Exception:
+            api_key = None
+
+    if not api_key:
+        raise ValueError(
+            "GEMINI_API_KEY não configurada no ambiente.\n"
+            "Se estiver usando Streamlit Cloud, adicione a variável em App Settings → Secrets (nome: GEMINI_API_KEY).\n"
+            "Para Docker/Render/Azure, configure a variável de ambiente GEMINI_API_KEY no painel do serviço."
+        )
+
     return genai.Client(api_key=api_key)
 
 def gerar_script_remediacao(row: pd.Series) -> str:

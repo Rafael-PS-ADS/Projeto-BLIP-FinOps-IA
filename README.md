@@ -15,6 +15,13 @@ git push origin main
 2) Variáveis de ambiente (necessárias em produção):
 - `GEMINI_API_KEY` — token da API Gemini. Não comite `.env`.
 
+Para testes locais você pode criar um `.env` a partir do exemplo:
+
+```bash
+cp .env.example .env
+# then open .env and replace the placeholder with your real key
+```
+
 Onde configurar a variável no host:
 - Streamlit Community Cloud: App Settings → Secrets → adicione `GEMINI_API_KEY`.
 - Render: Dashboard do serviço → Environment → Add Environment Variable.
